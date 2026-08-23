@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']
+  pull_request:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: hendrikmuhs/ccache-action@v1
+        if: runner.os == 'Linux'
+        with:
+          key: ci-${{ matrix.os }}
+      - name: Build
+        shell: bash
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF \
+            -DOMNIVOICE_SHARED=ON
+          cmake --build build --config Release -j 4
+      # Guessing the output directory is wrong: a Vulkan build on Linux leaves an
+      # empty build/Release behind. Find the binary and run whatever turns up.
+      - name: ABI test
+        shell: bash
+        run: |
+          abi=$(find build -type f \( -name test-abi-c -o -name test-abi-c.exe \) | head -1)
+          [ -n "$abi" ] || { echo "test-abi-c not found under build/"; exit 1; }
+          exec "$abi"

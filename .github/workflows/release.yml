@@ -1,0 +1,148 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64-cpu
+            os: ubuntu-22.04
+            flags: ''
+
+          - id: linux-x64-vulkan
+            os: ubuntu-22.04
+            flags: -DGGML_VULKAN=ON
+
+          - id: windows-x64-cpu
+            os: windows-2022
+            flags: ''
+
+          - id: windows-x64-vulkan
+            os: windows-2022
+            flags: -DGGML_VULKAN=ON
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0        # version.cmake reads the git history
+
+      - name: Install Vulkan SDK
+        if: contains(matrix.id, 'vulkan')
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime: true
+          cache: true
+
+      - uses: hendrikmuhs/ccache-action@v1
+        if: runner.os == 'Linux'
+        with:
+          key: ${{ matrix.id }}
+
+      # The shared library is what ctypes, cgo and bindgen consumers load. The
+      # bundled tools link the static core, so nothing else builds it.
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF \
+            -DOMNIVOICE_SHARED=ON -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+            ${{ matrix.flags }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release -j 4
+
+      # Multi-config generators put the binaries under build/Release, single-config
+      # ones in build. Guessing by directory is wrong: a Vulkan build on Linux
+      # leaves an empty build/Release behind. Find a known binary and follow it.
+      - name: Locate binaries
+        shell: bash
+        run: |
+          abi=$(find build -type f \( -name test-abi-c -o -name test-abi-c.exe \) | head -1)
+          [ -n "$abi" ] || { echo "test-abi-c not found under build/"; exit 1; }
+          echo "ABI_BIN=$abi" >> "$GITHUB_ENV"
+          echo "BIN_DIR=$(dirname "$abi")" >> "$GITHUB_ENV"
+
+      # A release that ships a broken public ABI is worse than no release: the
+      # consumers fail at load time, on the user's machine.
+      - name: ABI test
+        shell: bash
+        run: exec "$ABI_BIN"
+
+      # Symlinks are part of the payload, not noise: the binaries ask for
+      # libggml.so.0 and only the versioned file is a regular file.
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p package
+          find "$BIN_DIR" -maxdepth 1 \( -type f -o -type l \) \
+            ! -name 'test-abi-c*' ! -name 'vulkan-shaders-gen*' \
+            \( -name '*.so' -o -name '*.so.*' -o -name '*.dll' -o -name '*.exe' \
+               -o -name 'omnivoice-tts' -o -name 'omnivoice-codec' \
+               -o -name 'tts-server' -o -name 'quantize' \) \
+            -exec cp -P {} package/ \;
+          cp LICENSE README.md package/
+          ls -la package
+
+      # Run the packaged binary the way a user gets it: from the package
+      # directory, with nothing on the library path. Catches a missing symlink
+      # and an RPATH still pointing at the runner's build tree.
+      - name: Package smoke
+        shell: bash
+        run: |
+          cd package
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./omnivoice-tts.exe --help | head -1
+          else
+            env -u LD_LIBRARY_PATH ./omnivoice-tts --help | head -1
+          fi
+
+      - name: Archive
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "omnivoice-${{ matrix.id }}.zip" ./package/*
+          else
+            tar czf "omnivoice-${{ matrix.id }}.tar.gz" -C package .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omnivoice-${{ matrix.id }}
+          path: |
+            omnivoice-${{ matrix.id }}.tar.gz
+            omnivoice-${{ matrix.id }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
