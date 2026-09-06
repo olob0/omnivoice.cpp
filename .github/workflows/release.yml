@@ -24,14 +24,6 @@ jobs:
             os: ubuntu-22.04
             flags: -DGGML_VULKAN=ON
 
-          - id: windows-x64-cpu
-            os: windows-2022
-            flags: ''
-
-          - id: windows-x64-vulkan
-            os: windows-2022
-            flags: -DGGML_VULKAN=ON
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +38,6 @@ jobs:
           cache: true
 
       - uses: hendrikmuhs/ccache-action@v1
-        if: runner.os == 'Linux'
         with:
           key: ${{ matrix.id }}
 
@@ -70,7 +61,7 @@ jobs:
       - name: Locate binaries
         shell: bash
         run: |
-          abi=$(find build -type f \( -name test-abi-c -o -name test-abi-c.exe \) | head -1)
+          abi=$(find build -type f -name test-abi-c | head -1)
           [ -n "$abi" ] || { echo "test-abi-c not found under build/"; exit 1; }
           echo "ABI_BIN=$abi" >> "$GITHUB_ENV"
           echo "BIN_DIR=$(dirname "$abi")" >> "$GITHUB_ENV"
@@ -89,7 +80,7 @@ jobs:
           mkdir -p package
           find "$BIN_DIR" -maxdepth 1 \( -type f -o -type l \) \
             ! -name 'test-abi-c*' ! -name 'vulkan-shaders-gen*' \
-            \( -name '*.so' -o -name '*.so.*' -o -name '*.dll' -o -name '*.exe' \
+            \( -name '*.so' -o -name '*.so.*' \
                -o -name 'omnivoice-tts' -o -name 'omnivoice-codec' \
                -o -name 'tts-server' -o -name 'quantize' \) \
             -exec cp -P {} package/ \;
@@ -103,27 +94,16 @@ jobs:
         shell: bash
         run: |
           cd package
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ./omnivoice-tts.exe --help | head -1
-          else
-            env -u LD_LIBRARY_PATH ./omnivoice-tts --help | head -1
-          fi
+          env -u LD_LIBRARY_PATH ./omnivoice-tts --help | head -1
 
       - name: Archive
         shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "omnivoice-${{ matrix.id }}.zip" ./package/*
-          else
-            tar czf "omnivoice-${{ matrix.id }}.tar.gz" -C package .
-          fi
+        run: tar czf "omnivoice-${{ matrix.id }}.tar.gz" -C package .
 
       - uses: actions/upload-artifact@v4
         with:
           name: omnivoice-${{ matrix.id }}
-          path: |
-            omnivoice-${{ matrix.id }}.tar.gz
-            omnivoice-${{ matrix.id }}.zip
+          path: omnivoice-${{ matrix.id }}.tar.gz
           if-no-files-found: error
 
   publish:

@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022]
+        os: [ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - uses: hendrikmuhs/ccache-action@v1
-        if: runner.os == 'Linux'
         with:
           key: ci-${{ matrix.os }}
       - name: Build
@@ -34,6 +33,6 @@ jobs:
       - name: ABI test
         shell: bash
         run: |
-          abi=$(find build -type f \( -name test-abi-c -o -name test-abi-c.exe \) | head -1)
+          abi=$(find build -type f -name test-abi-c | head -1)
           [ -n "$abi" ] || { echo "test-abi-c not found under build/"; exit 1; }
           exec "$abi"
