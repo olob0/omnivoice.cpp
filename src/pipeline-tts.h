@@ -140,6 +140,17 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
                                                     int                 T_audio         = 0,
                                                     const char *        dump_hidden_dir = nullptr);
 
+// Writes the logits into a caller-owned buffer, resizing it only when the
+// shape changes. Returns false on error, leaving out unspecified. The
+// vector-returning wrapper above delegates here.
+bool pipeline_tts_llm_forward_batched_buf(PipelineTTS *       pt,
+                                          const int32_t *     input_ids,
+                                          MaskgitBatchedCtx * ctx,
+                                          int                 K,
+                                          int                 T_audio,
+                                          const char *        dump_hidden_dir,
+                                          std::vector<float> & out);
+
 // Release the static LM graph held by the context. Resets the scheduler so a
 // later graph of a different shape re-splits, then frees the graph context.
 // Safe to call on a context that never built a graph.

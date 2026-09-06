@@ -472,12 +472,15 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
         ggml_set_name(cond_audio, "cond_audio_logits");
         ggml_set_output(cond_audio);
 
-        size_t               uncond_offset = (size_t) 0 * logits->nb[2] + (size_t) 1 * logits->nb[3];
-        struct ggml_tensor * uncond_view =
-            ggml_view_4d(gctx, logits, V, K, T_audio, 1, logits->nb[1], logits->nb[2], logits->nb[3], uncond_offset);
-        uncond_audio = ggml_cont(gctx, uncond_view);
-        ggml_set_name(uncond_audio, "uncond_audio_logits");
-        ggml_set_output(uncond_audio);
+        // A single-row batch has no index 1, so there is no uncond view.
+        if (B_prime > 1) {
+            size_t               uncond_offset = (size_t) 0 * logits->nb[2] + (size_t) 1 * logits->nb[3];
+            struct ggml_tensor * uncond_view   = ggml_view_4d(gctx, logits, V, K, T_audio, 1, logits->nb[1],
+                                                             logits->nb[2], logits->nb[3], uncond_offset);
+            uncond_audio                       = ggml_cont(gctx, uncond_view);
+            ggml_set_name(uncond_audio, "uncond_audio_logits");
+            ggml_set_output(uncond_audio);
+        }
     } else {
         ggml_set_output(logits);
     }
@@ -485,7 +488,9 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
     struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
     if (T_audio > 0) {
         ggml_build_forward_expand(graph, cond_audio);
-        ggml_build_forward_expand(graph, uncond_audio);
+        if (uncond_audio) {
+            ggml_build_forward_expand(graph, uncond_audio);
+        }
     } else {
         ggml_build_forward_expand(graph, logits);
     }
@@ -534,30 +539,48 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
                                                     int                 K,
                                                     int                 T_audio,
                                                     const char *        dump_hidden_dir) {
+    std::vector<float> out;
+    if (!pipeline_tts_llm_forward_batched_buf(pt, input_ids, ctx, K, T_audio, dump_hidden_dir, out)) {
+        return {};
+    }
+    return out;
+}
+
+bool pipeline_tts_llm_forward_batched_buf(PipelineTTS *       pt,
+                                          const int32_t *     input_ids,
+                                          MaskgitBatchedCtx * ctx,
+                                          int                 K,
+                                          int                 T_audio,
+                                          const char *        dump_hidden_dir,
+                                          std::vector<float> & out) {
     if (!ctx) {
         ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] ctx is NULL");
-        return {};
+        return false;
     }
     const int B_prime = ctx->B_prime;
     const int S       = ctx->S;
     if (B_prime <= 0 || K <= 0 || S <= 0) {
-        return {};
+        return false;
     }
     if (K > pt->lm.num_audio_codebook) {
         ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] K=%d exceeds num_audio_codebook=%d", K, pt->lm.num_audio_codebook);
-        return {};
+        return false;
     }
     if (T_audio > S) {
         ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] T_audio=%d exceeds S=%d", T_audio, S);
-        return {};
+        return false;
     }
     // Hidden-state debug dumps still go through the single-forward path so the
     // cond and uncond rows land in their own bin files.
     const bool force_loop = getenv("OMNIVOICE_LOOP_FORWARD") != nullptr;
     if (dump_hidden_dir || force_loop) {
-        const int          V        = pt->lm.audio_vocab_size;
-        const size_t       per_item = (size_t) V * (size_t) K * (size_t) S;
-        std::vector<float> out((size_t) B_prime * per_item);
+        const int    V        = pt->lm.audio_vocab_size;
+        const size_t per_item = (size_t) V * (size_t) K * (size_t) S;
+        // Reuse the caller buffer; resize only when the shape changes.
+        // Every element is overwritten below.
+        if (out.size() != (size_t) B_prime * per_item) {
+            out.assign((size_t) B_prime * per_item, 0.0f);
+        }
         for (int b = 0; b < B_prime; b++) {
             const int32_t * ids_b  = input_ids + (size_t) b * (size_t) K * (size_t) S;
             const int32_t * mask_b = ctx->audio_mask_raw + (size_t) b * (size_t) S;
@@ -579,11 +602,11 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
             if (logits_b.size() != per_item) {
                 ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] dump-mode item %d returned %zu f32 (expected %zu)", b,
                        logits_b.size(), per_item);
-                return {};
+                return false;
             }
             std::copy(logits_b.begin(), logits_b.end(), out.begin() + (size_t) b * per_item);
         }
-        return out;
+        return true;
     }
 
     const int V = pt->lm.audio_vocab_size;
@@ -612,7 +635,7 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
     // the rest replay against the same allocation.
     if (!ctx->lm_built || ctx->lm_key_K != K || ctx->lm_key_T_audio != T_audio) {
         if (!lm_batched_graph_build(pt, ctx, K, T_audio)) {
-            return {};
+            return false;
         }
     }
 
@@ -638,22 +661,34 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
     enum ggml_status st = static_graph_compute(&ctx->lm_graph, pt->backend, pt->sched, ctx->lm_gf);
     if (st != GGML_STATUS_SUCCESS) {
         ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] graph_compute status=%d", (int) st);
-        return {};
+        return false;
     }
 
-    std::vector<float> out;
+    // Reuse the caller buffer; resize only when the shape changes.
+    // tensor_get overwrites all of it.
     if (T_audio > 0) {
         const size_t per_audio = (size_t) V * (size_t) K * (size_t) T_audio;
-        out.resize(2 * per_audio);
-        ggml_backend_tensor_get(ctx->lm_cond_audio, out.data(), 0, per_audio * sizeof(float));
-        ggml_backend_tensor_get(ctx->lm_uncond_audio, out.data() + per_audio, 0, per_audio * sizeof(float));
+        if (B_prime > 1) {
+            if (out.size() != 2 * per_audio) {
+                out.assign(2 * per_audio, 0.0f);
+            }
+            ggml_backend_tensor_get(ctx->lm_cond_audio, out.data(), 0, per_audio * sizeof(float));
+            ggml_backend_tensor_get(ctx->lm_uncond_audio, out.data() + per_audio, 0, per_audio * sizeof(float));
+        } else {
+            // Single-row batch: cond window only.
+            if (out.size() != per_audio) {
+                out.assign(per_audio, 0.0f);
+            }
+            ggml_backend_tensor_get(ctx->lm_cond_audio, out.data(), 0, per_audio * sizeof(float));
+        }
     } else {
         const size_t n = ggml_nelements(ctx->lm_logits);
-        out.resize(n);
+        if (out.size() != n) {
+            out.assign(n, 0.0f);
+        }
         ggml_backend_tensor_get(ctx->lm_logits, out.data(), 0, n * sizeof(float));
     }
-
-    return out;
+    return true;
 }
 
 // Release the static LM graph held by the context. Resets the scheduler so a
@@ -698,7 +733,13 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
     }
 
     PromptTTS prompt = {};
-    if (!prompt_tts_build(&prompt, tok, &pt->lm, text, lang, instruct, T, denoise, ref_text, ref_audio_tokens, ref_T)) {
+    // Guidance 0 never reads the uncond row, so build a cond-only batch and
+    // let the forward run a single row. The cond logits are not bit-identical
+    // to the two-row batch: B'=1 takes the 3D attention path, B'=2 the 4D one.
+    // OV_FORCE_CFG2=1 keeps the two-row batch.
+    const bool need_uncond = (mg_cfg.guidance_scale != 0.0f) || (std::getenv("OV_FORCE_CFG2") != nullptr);
+    if (!prompt_tts_build(&prompt, tok, &pt->lm, text, lang, instruct, T, denoise, ref_text, ref_audio_tokens, ref_T,
+                          need_uncond)) {
         return {};
     }
 
@@ -709,9 +750,11 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
         debug_init(&dbg, dump_dir);
         int             ids_shape[1] = { prompt.c_len };
         const int32_t * cond_row     = prompt.input_ids.data();
-        const int32_t * uncond_row   = prompt.input_ids.data() + (size_t) prompt.K * (size_t) prompt.c_len;
         debug_dump_i32_as_f32(&dbg, "prompt-cond-ids", cond_row, ids_shape, 1);
-        debug_dump_i32_as_f32(&dbg, "prompt-uncond-ids", uncond_row, ids_shape, 1);
+        if (prompt.B_prime > 1) {
+            const int32_t * uncond_row = prompt.input_ids.data() + (size_t) prompt.K * (size_t) prompt.c_len;
+            debug_dump_i32_as_f32(&dbg, "prompt-uncond-ids", uncond_row, ids_shape, 1);
+        }
     }
 
     ov_log(OV_LOG_INFO, "[TTS] Prompt: B'=%d K=%d S=%d c_len=%d u_len=%d", prompt.B_prime, prompt.K, prompt.S_max,

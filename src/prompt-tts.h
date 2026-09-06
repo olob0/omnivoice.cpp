@@ -212,6 +212,9 @@ static std::vector<int> prompt_tts_tokenize_nonverbal(const BPETokenizer * tok, 
 // ref_text is concatenated with text via _combine_text and contributes to the
 // shared text segment. The <|denoise|> marker is emitted if and only if
 // denoise=true AND ref_audio_tokens is not NULL (mirrors the reference).
+// need_uncond=false builds a cond-only batch (B'=1), for the case where
+// guidance is 0 and the uncond row is never read. Default true builds the
+// full CFG batch.
 static bool prompt_tts_build(PromptTTS *          out,
                              const BPETokenizer * tok,
                              const OmniVoiceLM *  lm,
@@ -222,7 +225,8 @@ static bool prompt_tts_build(PromptTTS *          out,
                              bool                 denoise,
                              const std::string &  ref_text,
                              const int32_t *      ref_audio_tokens,
-                             int                  ref_T) {
+                             int                  ref_T,
+                             bool                 need_uncond = true) {
     if (num_target_tokens <= 0) {
         fprintf(stderr, "[Prompt] FATAL: num_target_tokens must be positive (got %d)\n", num_target_tokens);
         return false;
@@ -233,7 +237,7 @@ static bool prompt_tts_build(PromptTTS *          out,
     }
     *out         = {};
     out->B       = 1;
-    out->B_prime = 2;
+    out->B_prime = need_uncond ? 2 : 1;
     out->K       = lm->num_audio_codebook;
 
     std::string style_text;
@@ -311,13 +315,16 @@ static bool prompt_tts_build(PromptTTS *          out,
 
     // Uncond row holds only the trailing target window (Stgt mask slots),
     // mirroring the reference batch_input_ids[B+i, :, :u_len] = input_ids[..., -u_len:].
-    for (int k = 0; k < K; k++) {
-        for (int s = 0; s < u_len; s++) {
-            uncond_at(k, s) = cond_at(k, c_len - Stgt + s);
+    // Not built when B'=1.
+    if (need_uncond) {
+        for (int k = 0; k < K; k++) {
+            for (int s = 0; s < u_len; s++) {
+                uncond_at(k, s) = cond_at(k, c_len - Stgt + s);
+            }
         }
-    }
-    for (int s = 0; s < u_len; s++) {
-        out->audio_mask[(size_t) 1 * (size_t) c_len + (size_t) s] = 1;
+        for (int s = 0; s < u_len; s++) {
+            out->audio_mask[(size_t) 1 * (size_t) c_len + (size_t) s] = 1;
+        }
     }
 
     auto attn_at = [&](int b, int sq, int skv) -> int32_t & {
@@ -332,14 +339,16 @@ static bool prompt_tts_build(PromptTTS *          out,
     }
 
     // Uncond row: full bidirectional inside the u_len target window, diagonal
-    // pads on the trailing positions [u_len, c_len).
-    for (int sq = 0; sq < u_len; sq++) {
-        for (int skv = 0; skv < u_len; skv++) {
-            attn_at(1, sq, skv) = 1;
+    // pads on the trailing positions [u_len, c_len). Not built when B'=1.
+    if (need_uncond) {
+        for (int sq = 0; sq < u_len; sq++) {
+            for (int skv = 0; skv < u_len; skv++) {
+                attn_at(1, sq, skv) = 1;
+            }
         }
-    }
-    for (int sq = u_len; sq < c_len; sq++) {
-        attn_at(1, sq, sq) = 1;
+        for (int sq = u_len; sq < c_len; sq++) {
+            attn_at(1, sq, sq) = 1;
+        }
     }
 
     fprintf(stderr, "[Prompt] Built: B'=%d K=%d S=%d N1=%d N2=%d Sref=%d Stgt=%d c_len=%d u_len=%d denoise=%d\n",

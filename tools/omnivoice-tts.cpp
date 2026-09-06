@@ -72,6 +72,7 @@ static void print_usage(const char * prog) {
             "  --ref-rvq <path>        Pre-encoded reference codes from omnivoice-codec (replaces --ref-wav)\n"
             "  --seed <int>            Sampling seed (default: -1 for random)\n"
             "  --steps <int>           MaskGIT decode steps (default: 32, fewer is faster)\n"
+            "  --guidance <float>      CFG scale (default: 2.0; 0 = unguided single-row fast path)\n"
             "  --no-preprocess-prompt  Skip ref-wav silence trim and ref-text terminal punctuation\n"
             "  --chunk-duration <sec>  Long-form chunk duration (default: 15.0, <= 0 disables chunking)\n"
             "  --chunk-threshold <sec> Activate chunking above this estimated duration (default: 30.0)\n"
@@ -235,6 +236,7 @@ static int run_srt_dub(ov_context *                 ov,
                        bool                         prompt_denoise,
                        bool                         preprocess_prompt,
                        int                          mg_steps,
+                       float                        mg_guidance,
                        uint64_t                     seed_resolved,
                        const char *                 dump_dir,
                        const char *                 output_path,
@@ -291,6 +293,9 @@ static int run_srt_dub(ov_context *                 ov,
         p.mg_seed           = seed_resolved;
         if (mg_steps > 0) {
             p.mg_num_step = mg_steps;
+        }
+        if (mg_guidance >= 0.0f) {
+            p.mg_guidance_scale = mg_guidance;
         }
         p.ref_audio_24k    = ref_audio.empty() ? nullptr : ref_audio.data();
         p.ref_n_samples    = (int) ref_audio.size();
@@ -387,6 +392,7 @@ static int run_tts_via_ov(const char * model_path,
                           bool         stream_by_line,
                           const char * srt_path,
                           int          mg_steps,
+                          float        mg_guidance,
                           uint64_t     seed_resolved,
                           const char * dump_dir,
                           const char * output_path,
@@ -450,7 +456,7 @@ static int run_tts_via_ov(const char * model_path,
     // streaming and buffered paths below.
     if (srt_path) {
         rc = run_srt_dub(ov, srt_path, ref_audio, ref_tokens, ref_T, ref_text, lang, prompt_instruct, prompt_denoise,
-                         preprocess_prompt, mg_steps, seed_resolved, dump_dir, output_path, wav_fmt);
+                         preprocess_prompt, mg_steps, mg_guidance, seed_resolved, dump_dir, output_path, wav_fmt);
         ov_free(ov);
         return rc;
     }
@@ -528,6 +534,9 @@ static int run_tts_via_ov(const char * model_path,
             params.mg_seed             = seed_resolved;
             if (mg_steps > 0) {
                 params.mg_num_step = mg_steps;
+            }
+            if (mg_guidance >= 0.0f) {
+                params.mg_guidance_scale = mg_guidance;
             }
             params.ref_audio_24k    = ref_audio.empty() ? nullptr : ref_audio.data();
             params.ref_n_samples    = (int) ref_audio.size();
@@ -637,6 +646,9 @@ static int run_tts_via_ov(const char * model_path,
     if (mg_steps > 0) {
         params.mg_num_step = mg_steps;
     }
+    if (mg_guidance >= 0.0f) {
+        params.mg_guidance_scale = mg_guidance;
+    }
     params.ref_audio_24k    = ref_audio.empty() ? nullptr : ref_audio.data();
     params.ref_n_samples    = (int) ref_audio.size();
     params.ref_audio_tokens = ref_tokens.empty() ? nullptr : ref_tokens.data();
@@ -689,6 +701,7 @@ static int main_impl(int argc, char ** argv) {
     bool         clamp_fp16             = false;
     int          seed_arg               = -1;
     int          mg_steps               = 0;
+    float        mg_guidance            = -1.0f;
     const char * dump_dir               = NULL;
     WavFormat    wav_fmt                = WAV_S16;
 
@@ -731,6 +744,12 @@ static int main_impl(int argc, char ** argv) {
             ref_text_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed_arg = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--guidance") == 0 && i + 1 < argc) {
+            mg_guidance = (float) atof(argv[++i]);
+            if (mg_guidance < 0.0f) {
+                fprintf(stderr, "[CLI] ERROR: --guidance must be >= 0\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             mg_steps = atoi(argv[++i]);
             if (mg_steps < 1) {
@@ -818,7 +837,7 @@ static int main_impl(int argc, char ** argv) {
     if (tts_mode) {
         return run_tts_via_ov(model_path, codec_path, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path, ref_text_path,
                               prompt_lang, prompt_instruct, prompt_duration_sec, prompt_denoise, preprocess_prompt,
-                              chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path, mg_steps,
+                              chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path, mg_steps, mg_guidance,
                               seed_resolved, dump_dir, output_path, wav_fmt);
     }
 
@@ -867,6 +886,9 @@ static int main_impl(int argc, char ** argv) {
             mg_cfg.seed                 = seed_resolved;
             if (mg_steps > 0) {
                 mg_cfg.num_step = mg_steps;
+            }
+            if (mg_guidance >= 0.0f) {
+                mg_cfg.guidance_scale = mg_guidance;
             }
 
             std::string text         = read_stdin_text();

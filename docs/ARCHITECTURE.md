@@ -727,6 +727,67 @@ hop truncation); the resulting .rvq feeds omnivoice-tts --ref-rvq directly.
 The `.rvq` file is a small binary container with shape `[8, T]` int32
 codes plus a header carrying the sample rate and frame rate.
 
+### tts-server
+
+OpenAI-compatible HTTP server over the public ABI, one GPU-resident
+context, synthesis serialized FIFO across connections. `src/tts-server.h`
+holds the HTTP core, `tools/tts-server.cpp` wires the `ov_*` ABI and the
+voice registry into it. Both response formats drive the streaming
+pipeline : pcm forwards each chunk to the socket as the codec produces
+it, wav collects them and emits a RIFF file. Verbatim `--help` :
+
+```
+Usage: ./build/tts-server --model <gguf> --codec <gguf> [options]
+
+Required:
+  --model <gguf>          LLM GGUF (F32 / BF16 / Q8_0)
+  --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)
+
+Optional:
+  --host <ip>             Listen address (default: 127.0.0.1)
+  --port <n>              Listen port (default: 8080)
+  --lang <str>            Language label when a request omits one (default 'None')
+  --no-fa                 Disable flash attention
+  --clamp-fp16            Clamp hidden states to FP16 range
+```
+
+Endpoints :
+
+```
+POST   /v1/audio/speech         OAI text-to-speech; response_format "pcm"
+                                streams s16le 24 kHz mono chunked as it is
+                                generated, "wav" returns a one-shot RIFF file.
+                                Optional fields: language overrides --lang for
+                                this request, voice selects a registered
+                                clone, instructions drives voice design, seed
+                                makes the request reproducible
+GET    /v1/models               single loaded model
+GET    /v1/audio/voices         registered cloned voices
+POST   /v1/audio/voices         register a cloned voice: {name, ref_text,
+                                wav_b64} encodes server side through
+                                ov_extract_voice_ref, {name, ref_text,
+                                rvq_b64} takes pre-encoded codes verbatim
+DELETE /v1/audio/voices/{name}  drop a registered voice
+GET    /health                  liveness probe
+```
+
+The model carries no speaker table, so every voice comes from the
+registry and a request without one runs voice design. Registered codes
+live in process RAM and feed `ref_audio_tokens`, which skips the codec
+encode on every turn. The two upload paths converge : a WAV encoded
+server side and the `.rvq` written by `omnivoice-codec` from the same
+clip produce bit-identical output, provided both use the same codec
+quantisation.
+
+A WAV upload runs the codec on the single synthesis context and takes
+the synthesis mutex. The registry holds its own mutex and the synthesize
+path copies the codes out under it, so a concurrent replace or delete
+never frees a buffer a running synthesis still reads.
+
+Reference loudness does not survive the registry : `ov_voice_ref` carries
+codes only, so a registered voice always lands on the `ref_rms < 0`
+branch and gets peak normalisation rather than the reference level.
+
 ## Module map
 
 ```
@@ -752,6 +813,8 @@ src/
                        Unicode category fallback)
 
   rvq-codec.h          Residual VQ encode + decode (8 codebooks)
+  rvq-file.h           Packed .rvq container, bit packing and unpacking
+                       from a file or a memory buffer
   dac-decoder.h        DAC acoustic decoder (5 blocks, ratios 8 5 4 2 3)
   dac-encoder.h        DAC acoustic encoder (mirror of decoder)
   semantic-enc.h       SemanticEncoder convs (768 -> 768)
@@ -773,10 +836,13 @@ src/
   omnivoice.{h,cpp}      Public ABI : opaque ov_context handle, plain C99
                          header in extern "C", consumable from C, C++,
                          Python ctypes, Rust bindgen, Go cgo
+  tts-server.h           OAI-compatible HTTP core : routing, JSON parsing,
+                         base64 upload decoding, s16le framing
 
 tools/
   omnivoice-tts.cpp    CLI : text to WAV (auto / design / clone)
   omnivoice-codec.cpp  CLI : codes <-> WAV
+  tts-server.cpp       HTTP server : ov_* ABI adapter and voice registry
   quantize.cpp         GGUF requantizer
   version.cmake        Embeds the git short hash into the binary
 

@@ -1,17 +1,21 @@
 #pragma once
-// tts-server.h: shared OpenAI-compatible TTS HTTP core for the *.cpp ports.
+// tts-server.h: OpenAI-compatible TTS HTTP core for omnivoice.cpp.
 //
 // One synthesis context lives GPU resident for the process lifetime. The
-// project tool fills a tts_backend adapter that wires its own ABI
-// (qt_synthesize / ov_synthesize) into the generic sink, then calls
-// tts_server_run. The HTTP layer, tuning, OAI parsing and audio framing
-// are identical across projects ; only the adapter differs.
+// tool fills a tts_backend adapter that wires ov_synthesize and the voice
+// registry into the generic sink, then calls tts_server_run. This file
+// holds the HTTP layer, tuning, OAI parsing and audio framing ; the ABI
+// stays entirely on the adapter side.
 //
 // Endpoints:
-//   POST /v1/audio/speech   OAI text-to-speech
-//   GET  /v1/models         single loaded model
-//   GET  /v1/voices         named speakers (empty when the model has none)
-//   GET  /health            liveness probe
+//   POST   /v1/audio/speech         OAI text-to-speech
+//   GET    /v1/audio/voices         registered cloned voices
+//   POST   /v1/audio/voices         register a cloned voice: {name, ref_text,
+//                                   wav_b64} encodes server side, {name,
+//                                   ref_text, rvq_b64} takes pre-encoded codes
+//   DELETE /v1/audio/voices/{name}  drop a registered voice
+//   GET    /v1/models               single loaded model
+//   GET    /health                  liveness probe
 //
 // Audio out: response_format "pcm" streams s16le 24 kHz mono chunked as it
 // is generated (real time), "wav" returns a one-shot RIFF file. pcm is the
@@ -33,15 +37,26 @@
 // One synthesis request parsed from the OAI JSON body.
 struct tts_request {
     std::string input;         // text to speak
-    std::string voice;         // OAI voice, mapped to a speaker by the adapter
+    std::string lang;          // language label, empty keeps the server default
+    std::string voice;         // registered voice name, empty runs voice design
     std::string instructions;  // OAI instructions, mapped to the ABI instruct field
     std::string format;        // "pcm" (stream) or "wav" (one-shot)
-    float       speed;         // OAI speed, parsed then ignored (no time stretch in the ABI)
 
     // Optional sampling seed. Negative or absent draws a hardware
     // random seed per request, matching the CLI convention; anything
     // else forwards verbatim for reproducible output.
     int64_t seed;
+};
+
+// One voice registration parsed from the POST /v1/audio/voices JSON body.
+// Exactly one payload form is present: wav holds decoded base64 WAV bytes
+// for server side encoding, or rvq holds the raw contents of a pre-encoded
+// .rvq file. ref_text carries the reference transcript.
+struct tts_voice_upload {
+    std::string name;
+    std::string ref_text;
+    std::string wav;  // WAV file bytes
+    std::string rvq;  // .rvq file bytes, packed codes
 };
 
 // The adapter pushes mono f32 24 kHz audio here. Returns false to abort the
@@ -51,13 +66,19 @@ using tts_sink = std::function<bool(const float * samples, int n_samples)>;
 
 // Adapter implemented by each project tool.
 struct tts_backend {
-    std::string              model_id;  // reported by GET /v1/models
-    std::vector<std::string> voices;    // reported by GET /v1/voices, may be empty
+    std::string model_id;  // reported by GET /v1/models
     // Run synthesis. When the request streams, the adapter routes the ABI
     // on_chunk to sink ; otherwise it pushes the whole buffer once. Returns
     // the ABI status (0 on success), and fills err with the ABI message on
     // failure. The shared layer maps the status to an HTTP code.
     std::function<int(const tts_request & req, const tts_sink & sink, std::string & err)> synthesize;
+
+    // Voice registry: register_voice stores or replaces a cloned voice,
+    // remove_voice drops one (false when absent), registered_voices lists
+    // the current names for GET /v1/audio/voices.
+    std::function<bool(const tts_voice_upload & up, std::string & err)> register_voice;
+    std::function<bool(const std::string & name)>                       remove_voice;
+    std::function<std::vector<std::string>()>                           registered_voices;
 };
 
 struct server_config {
@@ -133,6 +154,9 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
     }
     req.input = yyjson_get_str(input);
 
+    yyjson_val * language = yyjson_obj_get(root, "language");
+    req.lang              = yyjson_is_str(language) ? yyjson_get_str(language) : "";
+
     yyjson_val * voice = yyjson_obj_get(root, "voice");
     req.voice          = yyjson_is_str(voice) ? yyjson_get_str(voice) : "";
 
@@ -141,9 +165,6 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
 
     yyjson_val * fmt = yyjson_obj_get(root, "response_format");
     req.format       = yyjson_is_str(fmt) ? yyjson_get_str(fmt) : "pcm";
-
-    yyjson_val * speed = yyjson_obj_get(root, "speed");
-    req.speed          = yyjson_is_num(speed) ? (float) yyjson_get_num(speed) : 1.0f;
 
     yyjson_val * seed = yyjson_obj_get(root, "seed");
     if (seed && !yyjson_is_int(seed)) {
@@ -228,6 +249,119 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
     });
 }
 
+// Decode standard base64 (with optional padding) into out. Returns false
+// on any character outside the alphabet.
+static bool tts_b64_decode(const std::string & in, std::string & out) {
+    static const std::vector<int8_t> table = [] {
+        std::vector<int8_t> t(256, -1);
+        const char *        alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) {
+            t[(uint8_t) alpha[i]] = (int8_t) i;
+        }
+        return t;
+    }();
+
+    out.clear();
+    out.reserve(in.size() / 4 * 3);
+    uint32_t acc  = 0;
+    int      bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\n' || c == '\r') {
+            continue;
+        }
+        int8_t v = table[(uint8_t) c];
+        if (v < 0) {
+            return false;
+        }
+        acc = (acc << 6) | (uint32_t) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char) ((acc >> bits) & 0xff));
+        }
+    }
+    return true;
+}
+
+// Parse the POST /v1/audio/voices body: name, ref_text, and exactly one of
+// wav_b64 or rvq_b64. The transcript anchors the clone, so it is required.
+static bool tts_parse_voice_upload(const std::string & body, tts_voice_upload & up, std::string & err) {
+    yyjson_doc * doc = yyjson_read(body.c_str(), body.size(), 0);
+    if (!doc) {
+        err = "request body is not valid JSON";
+        return false;
+    }
+    yyjson_val * root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        err = "request body must be a JSON object";
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    yyjson_val * name = yyjson_obj_get(root, "name");
+    if (!yyjson_is_str(name) || yyjson_get_len(name) == 0) {
+        err = "'name' must be a non-empty string";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    up.name = yyjson_get_str(name);
+
+    yyjson_val * ref_text = yyjson_obj_get(root, "ref_text");
+    if (!yyjson_is_str(ref_text) || yyjson_get_len(ref_text) == 0) {
+        err = "'ref_text' must be a non-empty string";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    up.ref_text = yyjson_get_str(ref_text);
+
+    yyjson_val * wav = yyjson_obj_get(root, "wav_b64");
+    yyjson_val * rvq = yyjson_obj_get(root, "rvq_b64");
+
+    const bool has_wav = yyjson_is_str(wav) && yyjson_get_len(wav) > 0;
+    const bool has_rvq = yyjson_is_str(rvq) && yyjson_get_len(rvq) > 0;
+    if (has_wav == has_rvq) {
+        err = "provide either 'wav_b64' or 'rvq_b64'";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if ((has_wav && !tts_b64_decode(yyjson_get_str(wav), up.wav)) ||
+        (has_rvq && !tts_b64_decode(yyjson_get_str(rvq), up.rvq))) {
+        err = "invalid base64 payload";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    yyjson_doc_free(doc);
+    return true;
+}
+
+static void tts_handle_voice_register(const tts_backend &      be,
+                                      const httplib::Request & http_req,
+                                      httplib::Response &      res) {
+    tts_voice_upload up;
+    std::string      err;
+    if (!tts_parse_voice_upload(http_req.body, up, err)) {
+        tts_json_error(res, 400, "invalid_request_error", err.c_str());
+        return;
+    }
+    if (!be.register_voice(up, err)) {
+        tts_json_error(res, 400, "invalid_request_error", err.empty() ? "voice registration failed" : err.c_str());
+        return;
+    }
+    std::string body = "{\"name\":\"" + up.name + "\",\"status\":\"registered\"}";
+    res.set_content(body, "application/json");
+}
+
+static void tts_handle_voice_delete(const tts_backend &      be,
+                                    const httplib::Request & http_req,
+                                    httplib::Response &      res) {
+    const std::string name = http_req.matches[1];
+    if (!be.remove_voice(name)) {
+        tts_json_error(res, 404, "not_found_error", "no registered voice with this name");
+        return;
+    }
+    res.set_content("{\"status\":\"deleted\"}", "application/json");
+}
+
 static void tts_handle_models(const tts_backend & be, const httplib::Request &, httplib::Response & res) {
     yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
     yyjson_mut_val * root = yyjson_mut_obj(doc);
@@ -253,9 +387,9 @@ static void tts_handle_voices(const tts_backend & be, const httplib::Request &, 
     yyjson_mut_val * root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val * arr = yyjson_mut_arr(doc);
-    for (const std::string & v : be.voices) {
+    for (const std::string & v : be.registered_voices()) {
         yyjson_mut_val * one = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, one, "name", v.c_str());
+        yyjson_mut_obj_add_val(doc, one, "name", yyjson_mut_strcpy(doc, v.c_str()));
         yyjson_mut_arr_add_val(arr, one);
     }
     yyjson_mut_obj_add_val(doc, root, "voices", arr);
@@ -307,7 +441,7 @@ static int tts_server_run(const tts_backend & be, const server_config & cfg) {
         { "Access-Control-Allow-Origin", "*" }
     });
     svr.Options("/.*", [](const httplib::Request &, httplib::Response & res) {
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
     });
 
@@ -315,8 +449,12 @@ static int tts_server_run(const tts_backend & be, const server_config & cfg) {
              [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_speech(be, req, res); });
     svr.Get("/v1/models",
             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_models(be, req, res); });
-    svr.Get("/v1/voices",
+    svr.Get("/v1/audio/voices",
             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_voices(be, req, res); });
+    svr.Post("/v1/audio/voices",
+             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_voice_register(be, req, res); });
+    svr.Delete(R"(/v1/audio/voices/(.+))",
+               [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_voice_delete(be, req, res); });
     svr.Get("/health", tts_handle_health);
 
     signal(SIGINT, tts_on_signal);

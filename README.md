@@ -15,8 +15,9 @@ by GGML. C++17 port of OmniVoice (k2-fsa/OmniVoice). 646 languages,
 - Bit deterministic generation in greedy mode, seedable Philox PRNG
   for stochastic sampling
 - Q8_0 quantisation of the 612 M parameter Qwen3 backbone
-- Two CLI tools : `omnivoice-tts` (text -> WAV) and `omnivoice-codec`
-  (WAV <-> RVQ codes)
+- Three tools : `omnivoice-tts` (text -> WAV), `omnivoice-codec`
+  (WAV <-> RVQ codes) and `tts-server` (OpenAI-compatible HTTP server
+  with a cloned voice registry)
 
 ## Build
 
@@ -77,6 +78,33 @@ build/omnivoice-tts \
     --ref-rvq ref.rvq --ref-text ref.txt \
     --lang English -o out.wav < prompt.txt
 ```
+
+OpenAI-compatible server (`server.sh`, `client.sh`) : `response_format`
+"pcm" streams s16le as it is generated, "wav" returns a one-shot file.
+Cloned voices register once over HTTP (a WAV encoded server side, or a
+`.rvq` from `omnivoice-codec`), stay resident in RAM and are then
+selected by name on every request, so a caller holds one voice per
+language across turns without touching the disk. `language` overrides
+the server default for a single request :
+
+```
+./build/tts-server \
+    --model models/omnivoice-base-Q8_0.gguf \
+    --codec models/omnivoice-tokenizer-F32.gguf \
+    --port 8080
+
+curl -X POST localhost:8080/v1/audio/voices -H "Content-Type: application/json" \
+    -d "{\"name\":\"freeman\",\"ref_text\":\"$(cat ref.txt)\",
+         \"rvq_b64\":\"$(base64 -w0 ref.rvq)\"}"
+
+curl -X POST localhost:8080/v1/audio/speech -H "Content-Type: application/json" \
+    -d '{"input":"Hello world.","voice":"freeman","language":"English",
+         "response_format":"wav","seed":42}' -o out.wav
+```
+
+A `.rvq` payload must come from the same codec quantisation the server
+runs, otherwise the codes are read in the wrong space and the voice is
+not the expected one.
 
 ## Embedding the library
 
