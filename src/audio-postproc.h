@@ -72,16 +72,32 @@ static std::vector<float> postproc_s16_to_f32(const std::vector<int16_t> & s16) 
 // min_silence_len are in samples. Returns inclusive ranges [start, end] in
 // samples where end = start + min_silence_len of the last hit, exactly as
 // pydub builds them.
+//
+// Windows are scored from one prefix sum of squares, so each costs a single
+// subtraction. The compare is sqrt-free: sumsq <= thresh_lin^2 * count is
+// equivalent to rms <= thresh_lin.
 static std::vector<std::pair<int, int>> postproc_detect_silence(const std::vector<int16_t> & s16,
-                                                                int                          min_silence_len,
-                                                                double                       thresh_lin,
-                                                                int                          seek_step) {
+                                                                 int                          min_silence_len,
+                                                                 double                       thresh_lin,
+                                                                 int                          seek_step) {
     std::vector<std::pair<int, int>> ranges;
     int                              seg_len = (int) s16.size();
 
     if (seg_len < min_silence_len) {
         return ranges;
     }
+
+    // Prefix sum of squares: pref[i+1] = sum of s16[0..i]^2.
+    std::vector<int64_t> pref((size_t) seg_len + 1, 0);
+    for (int i = 0; i < seg_len; i++) {
+        int64_t s = s16[(size_t) i];
+        pref[(size_t) i + 1] = pref[(size_t) i] + s * s;
+    }
+    const double thresh_ssq = thresh_lin * thresh_lin * (double) min_silence_len;
+    auto         is_silent  = [&](int start) -> bool {
+        int64_t ssq = pref[(size_t) start + (size_t) min_silence_len] - pref[(size_t) start];
+        return (double) ssq <= thresh_ssq;
+    };
 
     int last_slice_start = seg_len - min_silence_len;
 
@@ -96,8 +112,7 @@ static std::vector<std::pair<int, int>> postproc_detect_silence(const std::vecto
 
     std::vector<int> silence_starts;
     for (int i : starts) {
-        double r = postproc_slice_rms_s16(s16, (size_t) i, (size_t) min_silence_len);
-        if (r <= thresh_lin) {
+        if (is_silent(i)) {
             silence_starts.push_back(i);
         }
     }

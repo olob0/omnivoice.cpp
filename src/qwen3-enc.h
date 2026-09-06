@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -201,7 +202,15 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
                                                   qwen3_attn_f32(ctx, q, k, v, mask, scale);
     if (use_flash_attn) {
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        // OV_FA_PREC=tf32 lowers the flash attention accumulation precision.
+        // Unset keeps F32.
+        enum ggml_prec prec = GGML_PREC_F32;
+        if (const char * p = std::getenv("OV_FA_PREC")) {
+            if (p[0] == 't' || p[0] == 'T') {
+                prec = GGML_PREC_DEFAULT;
+            }
+        }
+        ggml_flash_attn_ext_set_prec(attn, prec);
     }
 
     // 7) Reshape back: [D, Nh, S(, B)] -> [Nh*D, S(, B)]

@@ -3,6 +3,8 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <cstdlib>
+
 struct StaticGraph {
     ggml_gallocr_t galloc          = nullptr;
     bool           direct          = false;
@@ -32,7 +34,9 @@ static bool static_graph_alloc(StaticGraph *        sg,
                                ggml_backend_t       backend,
                                ggml_backend_sched_t sched,
                                struct ggml_cgraph * gf) {
-    if (static_graph_backend_supports(backend, gf)) {
+    // OV_FORCE_SCHED=1 skips the direct path and lets the scheduler run the
+    // graph instead.
+    if (!std::getenv("OV_FORCE_SCHED") && static_graph_backend_supports(backend, gf)) {
         sg->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (sg->galloc && ggml_gallocr_alloc_graph(sg->galloc, gf)) {
             sg->direct = true;

@@ -143,6 +143,10 @@ struct silence_remover_stream {
 
     std::vector<float>   buf_f;
     std::vector<int16_t> buf_s;
+    // Running prefix sum of squares over buf_s: pref_ssq[i+1] = sum of
+    // buf_s[0..i]^2. Lets the scans below score a window with one subtraction
+    // instead of summing it. buf_s is append-only, so indices stay valid.
+    std::vector<int64_t> pref_ssq{ 0 };
     size_t               emit_pos;
     bool                 lead_done;
     size_t               scan_pos;
@@ -160,6 +164,7 @@ struct silence_remover_stream {
         chunk_n      = sr / 100;
         buf_f.clear();
         buf_s.clear();
+        pref_ssq.assign(1, 0);
         emit_pos  = 0;
         lead_done = false;
         scan_pos  = 0;
@@ -182,7 +187,15 @@ struct silence_remover_stream {
             }
             buf_s[old + i] = (int16_t) v;
         }
+        pref_ssq.reserve(buf_s.size() + 1);
+        for (size_t i = old; i < buf_s.size(); i++) {
+            int64_t sq = (int64_t) buf_s[i] * (int64_t) buf_s[i];
+            pref_ssq.push_back(pref_ssq.back() + sq);
+        }
     }
+
+    // Sum of squares over [start, start + n).
+    int64_t ssq(size_t start, size_t n) const { return pref_ssq[start + n] - pref_ssq[start]; }
 
     template <class Emit> bool push(const float * samples, int n, Emit emit) {
         if (n <= 0) {
@@ -198,8 +211,8 @@ struct silence_remover_stream {
             while (trim < seg_len) {
                 int    slice_end = std::min(trim + chunk_n, seg_len);
                 int    sn        = slice_end - trim;
-                double r         = postproc_slice_rms_s16(buf_s, (size_t) trim, (size_t) sn);
-                if (r >= thresh_lin) {
+                // rms >= thresh_lin  <=>  ssq >= thresh_lin^2 * sn
+                if ((double) ssq((size_t) trim, (size_t) sn) >= thresh_lin * thresh_lin * (double) sn) {
                     break;
                 }
                 trim += chunk_n;
@@ -217,8 +230,9 @@ struct silence_remover_stream {
         // Mid scan: advance scan_pos by seek_step while we have a full
         // min_sil_n window ahead. Track contiguous silent runs in silent_grp.
         while (scan_pos + (size_t) min_sil_n <= buf_s.size()) {
-            double r         = postproc_slice_rms_s16(buf_s, scan_pos, (size_t) min_sil_n);
-            bool   is_silent = (r <= thresh_lin);
+            // rms <= thresh_lin  <=>  ssq <= thresh_lin^2 * min_sil_n
+            bool is_silent =
+                (double) ssq(scan_pos, (size_t) min_sil_n) <= thresh_lin * thresh_lin * (double) min_sil_n;
             if (is_silent) {
                 silent_grp.push_back(scan_pos);
             } else {

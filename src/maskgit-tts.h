@@ -18,7 +18,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 struct MaskgitConfig {
     int      num_step             = 32;
@@ -167,13 +172,52 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         (double) cfg.class_temperature, (double) cfg.position_temperature);
 
     double fwd_total_ms = 0.0;
+    double head_total_ms = 0.0;
 
     // Cache the inputs that stay constant across the 32 MaskGIT steps. The
     // attention mask in particular is heavy to convert to F16 (~9 ms on the
     // typical voice cloning shape), so building it once amortizes the cost.
+    //
+    // The uncond row is built over the full S window, not just its u_len
+    // target slots. The padding mask is additive and soft (+1.0 attended,
+    // +0.0 tail), not a hard block, so the diagonal-padded tail still carries
+    // attention mass; truncating it changes what the model computes.
+    const bool use_cfg = (cfg.guidance_scale != 0.0f);
     MaskgitBatchedCtx batched_ctx;
     pipeline_tts_llm_batched_ctx_init(&batched_ctx, prompt->audio_mask.data(), prompt->attention_mask.data(), B_prime,
                                       S);
+
+    // Scratch buffers for the step loop, allocated once and reused. The slot
+    // loops below run under OpenMP: each (k, t) slot is independent, so the
+    // result does not depend on the thread count. Without OpenMP the pragmas
+    // are no-ops. OV_QUIET silences the per-step log.
+    //
+    // Thread pool: one thread per physical core, unless OMP_NUM_THREADS or
+    // OV_OMP_THREADS says otherwise.
+    const bool quiet = (std::getenv("OV_QUIET") != nullptr);
+#ifdef _OPENMP
+    if (!std::getenv("OMP_NUM_THREADS") && !std::getenv("OV_OMP_THREADS")) {
+        int logical = (int) std::thread::hardware_concurrency();
+        int phys    = logical > 1 ? logical / 2 : 1;
+        omp_set_num_threads(phys > 0 ? phys : 1);
+    } else if (const char * ov = std::getenv("OV_OMP_THREADS")) {
+        int n = std::atoi(ov);
+        if (n > 0) {
+            omp_set_num_threads(n);
+        }
+    }
+#endif
+    const size_t n_slots  = (size_t) K * (size_t) T;
+    const size_t n_logrow = (size_t) K * (size_t) T * (size_t) V;
+    // Cond logits are extracted straight into log_probs. u_log holds the
+    // uncond row, which only the CFG path reads.
+    std::vector<float>   u_log(use_cfg ? n_logrow : 0);
+    std::vector<float>   log_probs(n_logrow);
+    std::vector<int32_t> pred_tokens(n_slots);
+    std::vector<float>   confidence(n_slots);
+    std::vector<int>     idx(n_slots);
+    // Forward output, reused across steps.
+    std::vector<float> logits_full;
 
     for (int step = 0; step < cfg.num_step; step++) {
         int k_demask = sched[step];
@@ -183,18 +227,22 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
         const char *                                hidden_dump = (step == 0 && dump_dir) ? dump_dir : nullptr;
         const std::chrono::steady_clock::time_point fwd_t0      = std::chrono::steady_clock::now();
-        std::vector<float>                          logits_full =
-            pipeline_tts_llm_forward_batched(pt, prompt->input_ids.data(), &batched_ctx, K, T, hidden_dump);
+        if (!pipeline_tts_llm_forward_batched_buf(pt, prompt->input_ids.data(), &batched_ctx, K, T, hidden_dump,
+                                                  logits_full)) {
+            pipeline_tts_llm_batched_ctx_free(pt, &batched_ctx);
+            return {};
+        }
         const std::chrono::steady_clock::time_point fwd_t1 = std::chrono::steady_clock::now();
         fwd_total_ms += std::chrono::duration<double, std::milli>(fwd_t1 - fwd_t0).count();
 
         // The forward returns either the full B'*V*K*S logits (debug path,
-        // hidden_dump set) or just the audio window 2*V*K*T (production path).
+        // hidden_dump set) or just the audio window B'*V*K*T (production path:
+        // B'=2 with CFG, B'=1 unguided).
         // Adapt the offsets accordingly.
         const bool   audio_only    = (hidden_dump == nullptr);
         const size_t per_audio     = (size_t) V * (size_t) K * (size_t) T;
         const size_t per_full_item = (size_t) V * (size_t) K * (size_t) S;
-        const size_t expected      = audio_only ? 2 * per_audio : (size_t) B_prime * per_full_item;
+        const size_t expected      = audio_only ? (size_t) B_prime * per_audio : (size_t) B_prime * per_full_item;
         if (logits_full.size() != expected) {
             fprintf(stderr, "[MaskGIT] FATAL: forward returned %zu f32 (expected %zu)\n", logits_full.size(), expected);
             pipeline_tts_llm_batched_ctx_free(pt, &batched_ctx);
@@ -202,21 +250,25 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         }
 
         // Extract cond and uncond logits at audio positions, layout [K, T, V].
-        // Audio-only path: cond and uncond are already compact [V, K, T] per
-        // row, source index = (t * K + k) * V on each row.
+        // Cond lands directly in log_probs (pre-softmax scratch); uncond in
+        // u_log. Audio-only path: cond and uncond are already compact
+        // [V, K, T] per row, source index = (t * K + k) * V on each row.
         // Full path: cond row 0 audio is at S range [audio_start_cond, S),
         // uncond row 1 audio is at [0, T).
-        std::vector<float> c_log((size_t) K * (size_t) T * (size_t) V);
-        std::vector<float> u_log((size_t) K * (size_t) T * (size_t) V);
         const float *      src_cond = audio_only ? logits_full.data() : logits_full.data() + 0 * per_full_item;
         const float * src_uncond = audio_only ? logits_full.data() + per_audio : logits_full.data() + 1 * per_full_item;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int k = 0; k < K; k++) {
             for (int t = 0; t < T; t++) {
                 size_t cond_off = audio_only ? ((size_t) t * K + k) * V : ((size_t) (audio_start_cond + t) * K + k) * V;
-                size_t uncond_off = ((size_t) t * K + k) * V;
-                size_t dst_off    = ((size_t) k * T + t) * V;
-                std::copy(src_cond + cond_off, src_cond + cond_off + V, c_log.begin() + dst_off);
-                std::copy(src_uncond + uncond_off, src_uncond + uncond_off + V, u_log.begin() + dst_off);
+                size_t dst_off  = ((size_t) k * T + t) * V;
+                std::copy(src_cond + cond_off, src_cond + cond_off + V, log_probs.begin() + dst_off);
+                if (use_cfg) {
+                    size_t uncond_off = ((size_t) t * K + k) * V;
+                    std::copy(src_uncond + uncond_off, src_uncond + uncond_off + V, u_log.begin() + dst_off);
+                }
             }
         }
 
@@ -226,70 +278,93 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         if (step == 0 && dump_dir) {
             DebugDumper dbg;
             debug_init(&dbg, dump_dir);
-            debug_dump_3d(&dbg, "lm-logits-step0-cond", c_log.data(), K, T, V);
-            debug_dump_3d(&dbg, "lm-logits-step0-uncond", u_log.data(), K, T, V);
+            debug_dump_3d(&dbg, "lm-logits-step0-cond", log_probs.data(), K, T, V);
+            // No uncond row to dump when B'=1.
+            if (use_cfg) {
+                debug_dump_3d(&dbg, "lm-logits-step0-uncond", u_log.data(), K, T, V);
+            }
         }
 
         // CFG + log_softmax pipeline. Result shape [K, T, V].
         // log_probs[v] = log_softmax(c_log_softmax + g * (c_log_softmax - u_log_softmax)).
-        std::vector<float> log_probs((size_t) K * (size_t) T * (size_t) V);
+        // Note log_probs doubles as the cond scratch: the first softmax runs
+        // in place on the extracted cond values, then folds in uncond.
+        const std::chrono::steady_clock::time_point head_t0 = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int k = 0; k < K; k++) {
             for (int t = 0; t < T; t++) {
                 size_t  off = ((size_t) k * T + t) * V;
-                float * c   = c_log.data() + off;
-                float * u   = u_log.data() + off;
                 float * lp  = log_probs.data() + off;
 
-                if (cfg.guidance_scale != 0.0f) {
-                    maskgit_log_softmax_inplace(c, V);
+                if (use_cfg) {
+                    float * u = u_log.data() + off;
+                    maskgit_log_softmax_inplace(lp, V);
                     maskgit_log_softmax_inplace(u, V);
                     for (int v = 0; v < V; v++) {
-                        lp[v] = c[v] + cfg.guidance_scale * (c[v] - u[v]);
+                        lp[v] = lp[v] + cfg.guidance_scale * (lp[v] - u[v]);
                     }
                     maskgit_log_softmax_inplace(lp, V);
                 } else {
-                    for (int v = 0; v < V; v++) {
-                        lp[v] = c[v];
-                    }
                     maskgit_log_softmax_inplace(lp, V);
                 }
                 lp[mask_id] = -INFINITY;
             }
         }
 
-        // Predict tokens + confidence per (k, t).
-        std::vector<int32_t> pred_tokens((size_t) K * (size_t) T);
-        std::vector<float>   confidence((size_t) K * (size_t) T);
-        for (int k = 0; k < K; k++) {
-            for (int t = 0; t < T; t++) {
-                size_t  off = ((size_t) k * T + t) * V;
-                float * lp  = log_probs.data() + off;
+        // Predict tokens + confidence per (k, t). The greedy path
+        // (class_temperature == 0) runs in parallel, one independent slot per
+        // iteration. Stochastic sampling stays serial: Philox ctr_lo is shared
+        // state advanced once per slot, so the order matters.
+        if (cfg.class_temperature > 0.0f) {
+            for (int k = 0; k < K; k++) {
+                for (int t = 0; t < T; t++) {
+                    size_t off = ((size_t) k * T + t) * V;
+                    float * lp = log_probs.data() + off;
 
-                std::vector<float> work;
-                float *            sample_src = lp;
-                if (cfg.class_temperature > 0.0f) {
-                    work.assign(lp, lp + V);
+                    std::vector<float> work(lp, lp + V);
                     maskgit_top_k_filter_inplace(work.data(), V, 0.1f);
                     maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, (int64_t) cfg.seed, ctr_lo);
-                    sample_src = work.data();
-                }
-                int   best_v = 0;
-                float best   = sample_src[0];
-                for (int v = 1; v < V; v++) {
-                    if (sample_src[v] > best) {
-                        best   = sample_src[v];
-                        best_v = v;
+                    int   best_v = 0;
+                    float best   = work[0];
+                    for (int v = 1; v < V; v++) {
+                        if (work[v] > best) {
+                            best   = work[v];
+                            best_v = v;
+                        }
                     }
-                }
-                pred_tokens[(size_t) k * T + t] = best_v;
+                    pred_tokens[(size_t) k * T + t] = best_v;
 
-                float max_lp = lp[0];
-                for (int v = 1; v < V; v++) {
-                    if (lp[v] > max_lp) {
-                        max_lp = lp[v];
+                    float max_lp = lp[0];
+                    for (int v = 1; v < V; v++) {
+                        if (lp[v] > max_lp) {
+                            max_lp = lp[v];
+                        }
                     }
+                    confidence[(size_t) k * T + t] = max_lp;
                 }
-                confidence[(size_t) k * T + t] = max_lp;
+            }
+        } else {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int k = 0; k < K; k++) {
+                for (int t = 0; t < T; t++) {
+                    size_t  off = ((size_t) k * T + t) * V;
+                    float * lp  = log_probs.data() + off;
+
+                    int   best_v = 0;
+                    float best   = lp[0];
+                    for (int v = 1; v < V; v++) {
+                        if (lp[v] > best) {
+                            best   = lp[v];
+                            best_v = v;
+                        }
+                    }
+                    pred_tokens[(size_t) k * T + t] = best_v;
+                    confidence[(size_t) k * T + t]  = best;
+                }
             }
         }
 
@@ -328,8 +403,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
         // Top-k indices on the flat scores (k slow, t fast). Indices are
         // i = k*T + t, mirroring Python's flatten on (K, T).
-        const int        N = K * T;
-        std::vector<int> idx(N);
+        const int N = K * T;
         for (int i = 0; i < N; i++) {
             idx[i] = i;
         }
@@ -348,16 +422,23 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
             // cond row: input_ids[0, k, audio_start_cond + t]
             prompt->input_ids[((size_t) 0 * K + k) * S + (size_t) (audio_start_cond + t)] = v;
-            // uncond row: input_ids[1, k, t]
-            prompt->input_ids[((size_t) 1 * K + k) * S + (size_t) t]                      = v;
+            // uncond row: input_ids[1, k, t] (absent when B'=1)
+            if (B_prime > 1) {
+                prompt->input_ids[((size_t) 1 * K + k) * S + (size_t) t] = v;
+            }
         }
 
-        fprintf(stderr, "[MaskGIT-Step] %d/%d demask=%d remaining=%d\n", step + 1, cfg.num_step, k_demask,
-                (int) std::count(tokens.begin(), tokens.end(), mask_id));
+        if (!quiet) {
+            fprintf(stderr, "[MaskGIT-Step] %d/%d demask=%d remaining=%d\n", step + 1, cfg.num_step, k_demask,
+                    (int) std::count(tokens.begin(), tokens.end(), mask_id));
+        }
+        const std::chrono::steady_clock::time_point head_t1 = std::chrono::steady_clock::now();
+        head_total_ms += std::chrono::duration<double, std::milli>(head_t1 - head_t0).count();
     }
 
-    fprintf(stderr, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step)\n", fwd_total_ms,
-            cfg.num_step, fwd_total_ms / (double) cfg.num_step);
+    fprintf(stderr, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step), head: %.2f ms (avg %.2f ms/step)\n",
+            fwd_total_ms, cfg.num_step, fwd_total_ms / (double) cfg.num_step, head_total_ms,
+            head_total_ms / (double) cfg.num_step);
 
     if (ctr_lo_inout != nullptr) {
         *ctr_lo_inout = ctr_lo;

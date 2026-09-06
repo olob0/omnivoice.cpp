@@ -26,7 +26,17 @@ struct BackendPair {
 // Physical core count heuristic (logical / 2 for HT/SMT).
 // Used for GGML CPU thread count: GEMM shares SIMD units across hyperthreads,
 // so one thread per physical core is optimal.
+// OV_THREADS, GGML_NUM_THREADS or OMP_NUM_THREADS override the heuristic;
+// the first one set wins.
 static int backend_cpu_n_threads(void) {
+    for (const char * name : { "OV_THREADS", "GGML_NUM_THREADS", "OMP_NUM_THREADS" }) {
+        if (const char * v = std::getenv(name)) {
+            int n = std::atoi(v);
+            if (n > 0) {
+                return n;
+            }
+        }
+    }
     int n = (int) std::thread::hardware_concurrency() / 2;
     return n > 0 ? n : 1;
 }

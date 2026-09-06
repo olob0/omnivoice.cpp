@@ -19,6 +19,13 @@ add_custom_target(version ALL
 # and older x86_64 toolchains need the explicit dependency.
 find_package(Threads REQUIRED)
 
+# OpenMP parallelises the MaskGIT head loops in src/maskgit-tts.h.
+# Optional: without it the pragmas are no-ops.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found, MaskGIT head will run multithreaded")
+endif()
+
 # Suppress MSVC fopen/sprintf deprecation warnings, force UTF-8 source and
 # execution charsets so non-ASCII string literals (CJK in voice-design.h,
 # lang-map.h, text-chunker.h) survive the compile without a BOM. /utf-8 is
@@ -94,6 +101,9 @@ macro(link_ggml_backends target)
                               -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion)
     endif()
     target_link_libraries(${target} PRIVATE ggml Threads::Threads)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     if(TARGET ggml-base)
         target_link_libraries(${target} PRIVATE ggml-base)
     endif()
