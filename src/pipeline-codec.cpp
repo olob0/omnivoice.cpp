@@ -24,11 +24,22 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "ov-error.h"
-#include "utf8.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// Dump a backend f32 tensor through the debug dumper, shape slow to fast.
+static void debug_dump_tensor(const DebugDumper * d, const char * name, const struct ggml_tensor * t) {
+    std::vector<float> tmp((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size() * sizeof(float));
+    const int n_dims   = ggml_n_dims(t);
+    int       shape[4] = { 0 };
+    for (int i = 0; i < n_dims; i++) {
+        shape[i] = (int) t->ne[n_dims - 1 - i];
+    }
+    debug_dump(d, name, tmp.data(), shape, n_dims);
+}
 
 bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
     *pc                    = {};
@@ -193,7 +204,11 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     return true;
 }
 
-std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int num_codebooks, int n_frames) {
+std::vector<float> pipeline_codec_decode(PipelineCodec * pc,
+                                         const int32_t * codes,
+                                         int             num_codebooks,
+                                         int             n_frames,
+                                         const char *    dump_dir) {
     if (num_codebooks != RVQ_NUM_CODEBOOKS) {
         ov_log(OV_LOG_ERROR, "[PipelineCodec] codes have %d codebooks, expected %d", num_codebooks, RVQ_NUM_CODEBOOKS);
         return {};
@@ -244,7 +259,7 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     // Optional debug: keep RVQ and fc2 outputs alive across the graph compute
     // so we can copy them back. Without this the gallocr is free to reuse
     // their backing memory once consumed downstream.
-    const bool dump = std::getenv("OMNIVOICE_DUMP_STAGES") != NULL;
+    const bool dump = dump_dir != NULL;
     if (dump) {
         ggml_set_output(latent);
         ggml_set_output(fc2_out);
@@ -292,22 +307,14 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
 
     // Optional debug dump of intermediate stages.
     if (dump) {
-        auto dump_tensor = [](const char * path, struct ggml_tensor * t) {
-            const size_t       n = ggml_nelements(t);
-            std::vector<float> tmp(n);
-            ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(float));
-            FILE * f = utf8_fopen(path, "wb");
-            fwrite(tmp.data(), sizeof(float), n, f);
-            fclose(f);
-            ov_log(OV_LOG_INFO, "[PipelineCodec] Dumped %s: %zu f32 values, ne=(%lld, %lld, %lld, %lld)", path, n,
-                   (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
-        };
-        dump_tensor("cpp_rvq_out.raw", latent);
-        dump_tensor("cpp_fc2_out.raw", fc2_out);
+        DebugDumper dbg;
+        debug_init(&dbg, dump_dir);
+        debug_dump_tensor(&dbg, "codec-rvq-out", latent);
+        debug_dump_tensor(&dbg, "codec-fc2-out", fc2_out);
         for (auto * t : dac_stages) {
-            char path[64];
-            snprintf(path, sizeof(path), "cpp_%s.raw", ggml_get_name(t));
-            dump_tensor(path, t);
+            char name[64];
+            snprintf(name, sizeof(name), "codec-%s", ggml_get_name(t));
+            debug_dump_tensor(&dbg, name, t);
         }
     }
 
@@ -471,7 +478,7 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
     // Optional debug: keep pre_fc and embed alive across the graph so we can
     // copy them back post compute, to compare the RVQ input bit-for-bit and
     // isolate where the divergence is born (concat vs fc Linear).
-    const bool dump = std::getenv("OMNIVOICE_DUMP_STAGES") != NULL;
+    const bool dump = dump_dir != NULL;
     if (dump) {
         ggml_set_output(pre_fc);
         ggml_set_output(embed);
@@ -509,18 +516,10 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
 
     // Optional debug dump of the fc input (post concat) and output (RVQ input).
     if (dump) {
-        auto dump_tensor = [](const char * path, struct ggml_tensor * t) {
-            const size_t       n = ggml_nelements(t);
-            std::vector<float> tmp(n);
-            ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(float));
-            FILE * f = utf8_fopen(path, "wb");
-            fwrite(tmp.data(), sizeof(float), n, f);
-            fclose(f);
-            ov_log(OV_LOG_INFO, "[Encode] Dumped %s: %zu f32 values, ne=(%lld, %lld)", path, n, (long long) t->ne[0],
-                   (long long) t->ne[1]);
-        };
-        dump_tensor("cpp_encode_pre_fc.raw", pre_fc);
-        dump_tensor("cpp_encode_embed.raw", embed);
+        DebugDumper dbg;
+        debug_init(&dbg, dump_dir);
+        debug_dump_tensor(&dbg, "codec-encode-pre-fc", pre_fc);
+        debug_dump_tensor(&dbg, "codec-encode-embed", embed);
     }
 
     // Pack codes row-major: (CB, T) with codebook leading.

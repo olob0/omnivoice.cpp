@@ -376,6 +376,8 @@ def main():
     ap.add_argument("--duration",  type=float, default=None)
     ap.add_argument("--quant",     default="F32",
                     help="quantization suffix for GGUF (default: F32, e.g. BF16, Q8_0, Q4_K_M)")
+    ap.add_argument("--device",    default=None,
+                    help="GGML device passed to omnivoice-tts (default: best available)")
     ap.add_argument("--out-cpp",   default="cpp/clone-cpp.wav")
     ap.add_argument("--out-pt",    default="python/clone-python.wav")
     args = ap.parse_args()
@@ -444,6 +446,8 @@ def main():
     ]
     if args.duration:
         cmd += ["--duration", str(args.duration)]
+    if args.device:
+        cmd += ["--device", args.device]
     print(f"[GGML] Cmd: {' '.join(cmd)}")
     r = subprocess.run(cmd, input=text, text=True)
     if r.returncode != 0:

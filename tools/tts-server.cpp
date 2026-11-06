@@ -9,6 +9,7 @@
 
 #include "tts-server.h"
 
+#include "backend.h"
 #include "omnivoice.h"
 #include "rvq-file.h"
 #include "version.h"
@@ -48,6 +49,8 @@ static void print_usage(const char * prog) {
             "  --model <gguf>          LLM GGUF (F32 / BF16 / Q8_0)\n"
             "  --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n\n"
             "Optional:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  --host <ip>             Listen address (default: 127.0.0.1)\n"
             "  --port <n>              Listen port (default: 8080)\n"
             "  --lang <str>            Language label when a request omits one (default 'None')\n"
@@ -66,6 +69,7 @@ static std::string basename_of(const char * path) {
 int main(int argc, char ** argv) {
     const char *  model_path = NULL;
     const char *  codec_path = NULL;
+    const char *  device     = NULL;
     std::string   lang       = "None";
     server_config cfg;
     bool          use_fa     = true;
@@ -77,6 +81,8 @@ int main(int argc, char ** argv) {
             model_path = argv[++i];
         } else if (!std::strcmp(arg, "--codec") && i + 1 < argc) {
             codec_path = argv[++i];
+        } else if (!std::strcmp(arg, "--device") && i + 1 < argc) {
+            device = argv[++i];
         } else if (!std::strcmp(arg, "--host") && i + 1 < argc) {
             cfg.host = argv[++i];
         } else if (!std::strcmp(arg, "--port") && i + 1 < argc) {
@@ -87,17 +93,17 @@ int main(int argc, char ** argv) {
             use_fa = false;
         } else if (!std::strcmp(arg, "--clamp-fp16")) {
             clamp_fp16 = true;
-        } else if (!std::strcmp(arg, "--help") || !std::strcmp(arg, "-h")) {
-            print_usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "[CLI] ERROR: unknown arg: %s\n", arg);
             print_usage(argv[0]);
             return 1;
         }
     }
 
     if (!model_path || !codec_path) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (device && !backend_check_device(device)) {
         print_usage(argv[0]);
         return 1;
     }
@@ -108,6 +114,7 @@ int main(int argc, char ** argv) {
     iparams.codec_path = codec_path;
     iparams.use_fa     = use_fa;
     iparams.clamp_fp16 = clamp_fp16;
+    iparams.device     = device;
 
     struct ov_context * ov = ov_init(&iparams);
     if (!ov) {

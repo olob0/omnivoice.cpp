@@ -69,6 +69,10 @@ int main(void) {
         fprintf(stderr, "[Probe] abi_version not set by ov_*_default_params\n");
         return 1;
     }
+    if (iparams.device) {
+        fprintf(stderr, "[Probe] init_params device default is not NULL\n");
+        return 1;
+    }
 
     /* Touch every reference-pointer field, every callback typedef and
      * every output struct field so the compiler validates the layout

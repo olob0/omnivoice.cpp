@@ -69,7 +69,13 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
 // Decode RVQ codes into a mono 24 kHz waveform.
 //   codes: row-major i32, num_codebooks rows of n_frames each (T fast).
 // Returns audio of length n_frames * pc->hop_length, empty on failure.
-std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int num_codebooks, int n_frames);
+// dump_dir: when non null, writes the RVQ output, the fc2 output and every
+// DAC stage as debug binaries into that directory. Pass NULL to skip.
+std::vector<float> pipeline_codec_decode(PipelineCodec * pc,
+                                         const int32_t * codes,
+                                         int             num_codebooks,
+                                         int             n_frames,
+                                         const char *    dump_dir = NULL);
 
 // Encode a 24 kHz mono waveform into RVQ codes. Chains the full audio
 // tokenizer pipeline :
@@ -81,8 +87,9 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
 //   fc Linear (1024 -> 1024)           -> projected        (1024, T)
 //   RVQ encode loop                    -> codes            (CB=8, T) i32
 // Returns codes flat in (CB, T) row-major, empty on failure.
-// dump_dir: when non null, writes ref-audio-16k and ref-hubert-features
-// debug binaries into that directory. Pass NULL to skip.
+// dump_dir: when non null, writes ref-audio-16k, ref-hubert-features, the
+// fc input and the fc output as debug binaries into that directory. Pass
+// NULL to skip.
 std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
                                            const float *   audio_24k,
                                            int             n_samples,

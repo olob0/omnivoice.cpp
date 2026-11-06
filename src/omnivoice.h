@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 3
+#define OV_ABI_VERSION 4
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -104,18 +104,21 @@ struct ov_context;
 // codec_path is NULL the codec module is skipped and ov_synthesize fails
 // immediately with OV_STATUS_INVALID_PARAMS. use_fa enables flash
 // attention when a GPU backend is present; clamp_fp16 guards FP16
-// matmul accumulation on sub-Ampere CUDA. abi_version stays first so a
-// future struct growth keeps reading the version field at offset 0.
+// matmul accumulation on sub-Ampere CUDA. device names the GGML device
+// the handle runs on (CUDA0, Vulkan0, MTL0, CPU...), NULL selects the
+// best available one (since ABI 4). abi_version stays first so a future
+// struct growth keeps reading the version field at offset 0.
 struct ov_init_params {
     int          abi_version;
     const char * model_path;
     const char * codec_path;
     bool         use_fa;
     bool         clamp_fp16;
+    const char * device;
 };
 
 // Initialise to the standard defaults: codec_path NULL (caller must set
-// it for synthesis), use_fa true, clamp_fp16 false.
+// it for synthesis), use_fa true, clamp_fp16 false, device NULL.
 OV_API void ov_init_default_params(struct ov_init_params * p);
 
 // Allocate every module described by params. Returns NULL on any failure
@@ -181,10 +184,12 @@ OV_API void ov_log_set(ov_log_cb cb, void * user_data);
 struct ov_tts_params {
     int abi_version;
 
-    // Input text and language hint. lang accepts "" (auto), "en" or "zh"
-    // matching the upstream OmniVoice convention. instruct is the raw
-    // attribute string ("female young adult moderate"), validated and
-    // normalised internally against the bundled VoiceDesign.
+    // Input text and language hint. lang accepts "" or "none" for auto, an
+    // ISO id ("fr") or a language name ("french"), resolved against the table
+    // the model was trained with; ov_n_languages enumerates it, and anything
+    // else is OV_STATUS_INVALID_PARAMS. instruct is the raw attribute string
+    // ("female young adult moderate"), validated and normalised internally
+    // against the bundled VoiceDesign.
     const char * text;
     const char * lang;
     const char * instruct;
@@ -273,6 +278,15 @@ OV_API int ov_duration_sec_to_tokens(const struct ov_context * ov, float duratio
 // callers reading a packed .rvq stream need K to derive ref_T from the
 // code count. Returns 0 on a NULL handle.
 OV_API int ov_num_codebooks(const struct ov_context * ov);
+
+// Languages the synthesis accepts as a hint, in the order of the bundled
+// table. An empty hint leaves the model to infer one from the text, so "auto"
+// is not an entry here. The id is what the prompt carries ("fr"), the name is
+// what a user reads ("french"); both pointers are static and outlive any
+// context.
+OV_API int          ov_n_languages(void);
+OV_API const char * ov_language_id(int i);
+OV_API const char * ov_language_name(int i);
 
 // Pre-encoded voice reference codes, the in-process equivalent of an
 // omnivoice-codec CLI encode. Plain POD: ref_codes is malloc allocated

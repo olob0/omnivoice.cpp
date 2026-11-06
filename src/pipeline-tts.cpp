@@ -572,8 +572,7 @@ bool pipeline_tts_llm_forward_batched_buf(PipelineTTS *       pt,
     }
     // Hidden-state debug dumps still go through the single-forward path so the
     // cond and uncond rows land in their own bin files.
-    const bool force_loop = getenv("OMNIVOICE_LOOP_FORWARD") != nullptr;
-    if (dump_hidden_dir || force_loop) {
+    if (dump_hidden_dir) {
         const int    V        = pt->lm.audio_vocab_size;
         const size_t per_item = (size_t) V * (size_t) K * (size_t) S;
         // Reuse the caller buffer; resize only when the shape changes.
@@ -841,7 +840,7 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
 
     ov_log(OV_LOG_INFO, "[TTS] Decode: K=%d T=%d expected_samples=%d", K, T, T * pc->hop_length);
     Timer              t_codec;
-    std::vector<float> audio    = pipeline_codec_decode(pc, tokens.data(), K, T);
+    std::vector<float> audio    = pipeline_codec_decode(pc, tokens.data(), K, T, dump_dir);
     const double       codec_ms = t_codec.ms();
 
     if (!audio.empty()) {
@@ -997,7 +996,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                     return {};
                 }
 
-                std::vector<float> a = pipeline_codec_decode(pc, chunk0_tokens.data(), K, Ti);
+                std::vector<float> a = pipeline_codec_decode(pc, chunk0_tokens.data(), K, Ti, chunk_dump_dir);
                 if (a.empty()) {
                     ov_log(OV_LOG_ERROR, "[TTS-Long] chunk 0 decode failed");
                     return {};
@@ -1256,7 +1255,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
                     return OV_STATUS_GENERATE_FAILED;
                 }
 
-                std::vector<float> a = pipeline_codec_decode(pc, chunk0_tokens.data(), K, Ti);
+                std::vector<float> a = pipeline_codec_decode(pc, chunk0_tokens.data(), K, Ti, chunk_dump_dir);
                 if (a.empty()) {
                     ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk 0 decode failed");
                     return OV_STATUS_GENERATE_FAILED;

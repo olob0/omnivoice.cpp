@@ -62,6 +62,8 @@ static void print_usage(const char * prog) {
             "                          timeline WAV ready to mux. Pairs with --ref-wav / --ref-rvq\n"
             "                          for a cloned voice. Per cue duration comes from the SRT.\n\n"
             "Optional:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
             "  --lang <str>            Language label (default 'None')\n"
             "  --instruct <str>        Style instruction (default 'None')\n"
@@ -377,6 +379,7 @@ static int run_srt_dub(ov_context *                 ov,
 // completely untouched.
 static int run_tts_via_ov(const char * model_path,
                           const char * codec_path,
+                          const char * device,
                           bool         use_fa,
                           bool         clamp_fp16,
                           const char * ref_wav_path,
@@ -403,6 +406,7 @@ static int run_tts_via_ov(const char * model_path,
     iparams.codec_path = codec_path;
     iparams.use_fa     = use_fa;
     iparams.clamp_fp16 = clamp_fp16;
+    iparams.device     = device;
 
     ov_context * ov = ov_init(&iparams);
     if (!ov) {
@@ -673,7 +677,7 @@ static int run_tts_via_ov(const char * model_path,
 static int main_impl(int argc, char ** argv) {
     if (argc <= 1) {
         print_usage(argv[0]);
-        return 0;
+        return 1;
     }
 
     VoiceDesign vd;
@@ -681,6 +685,7 @@ static int main_impl(int argc, char ** argv) {
 
     const char * model_path             = NULL;
     const char * codec_path             = NULL;
+    const char * device                 = NULL;
     const char * llm_test_in            = NULL;
     bool         maskgit_test_mode      = false;
     const char * prompt_lang            = NULL;
@@ -710,6 +715,8 @@ static int main_impl(int argc, char ** argv) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             codec_path = argv[++i];
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            device = argv[++i];
         } else if (strcmp(argv[i], "--no-fa") == 0) {
             use_fa = false;
         } else if (strcmp(argv[i], "--clamp-fp16") == 0) {
@@ -766,11 +773,7 @@ static int main_impl(int argc, char ** argv) {
                 print_usage(argv[0]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "[CLI] ERROR: unknown arg: %s\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
@@ -790,6 +793,10 @@ static int main_impl(int argc, char ** argv) {
         return 1;
     }
     if (!output_path) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (device && !backend_check_device(device)) {
         print_usage(argv[0]);
         return 1;
     }
@@ -835,13 +842,13 @@ static int main_impl(int argc, char ** argv) {
     // TTS mode runs through the OmniVoice handle. Debug modes (--llm-test,
     // --maskgit-test) keep their lower-level init flow below.
     if (tts_mode) {
-        return run_tts_via_ov(model_path, codec_path, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path, ref_text_path,
-                              prompt_lang, prompt_instruct, prompt_duration_sec, prompt_denoise, preprocess_prompt,
-                              chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path, mg_steps, mg_guidance,
-                              seed_resolved, dump_dir, output_path, wav_fmt);
+        return run_tts_via_ov(model_path, codec_path, device, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path,
+                              ref_text_path, prompt_lang, prompt_instruct, prompt_duration_sec, prompt_denoise,
+                              preprocess_prompt, chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path,
+                              mg_steps, mg_guidance, seed_resolved, dump_dir, output_path, wav_fmt);
     }
 
-    BackendPair bp = backend_init("LM");
+    BackendPair bp = backend_init("LM", device);
     if (!bp.backend) {
         return 1;
     }

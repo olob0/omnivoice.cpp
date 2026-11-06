@@ -680,6 +680,8 @@ Input:
                           for a cloned voice. Per cue duration comes from the SRT.
 
 Optional:
+  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...
+                          (default: best available)
   --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)
   --lang <str>            Language label (default 'None')
   --instruct <str>        Style instruction (default 'None')
@@ -717,6 +719,8 @@ Required:
   -i <path>               Input. WAV -> encode, .rvq -> decode
 
 Optional:
+  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...
+                          (default: best available)
   --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)
 
 Output is auto-named next to input : clip.wav -> clip.rvq, clip.rvq -> clip.wav.
@@ -744,6 +748,8 @@ Required:
   --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)
 
 Optional:
+  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...
+                          (default: best available)
   --host <ip>             Listen address (default: 127.0.0.1)
   --port <n>              Listen port (default: 8080)
   --lang <str>            Language label when a request omits one (default 'None')
@@ -758,9 +764,10 @@ POST   /v1/audio/speech         OAI text-to-speech; response_format "pcm"
                                 streams s16le 24 kHz mono chunked as it is
                                 generated, "wav" returns a one-shot RIFF file.
                                 Optional fields: language overrides --lang for
-                                this request, voice selects a registered
-                                clone, instructions drives voice design, seed
-                                makes the request reproducible
+                                this request (an unknown one is a 400), voice
+                                selects a registered clone, instructions drives
+                                voice design, seed makes the request
+                                reproducible
 GET    /v1/models               single loaded model
 GET    /v1/audio/voices         registered cloned voices
 POST   /v1/audio/voices         register a cloned voice: {name, ref_text,

@@ -41,6 +41,8 @@ static void print_usage(const char * prog) {
             "  --model <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n"
             "  -i <path>               Input. WAV -> encode, .rvq -> decode\n\n"
             "Optional:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n\n"
             "Output is auto-named next to input : clip.wav -> clip.rvq, clip.rvq -> clip.wav.\n"
             "Encode applies the TTS reference preprocessing (RMS auto-gain, silence trim,\n"
@@ -72,11 +74,12 @@ static int infer_mode(const char * path) {
 int main_impl(int argc, char ** argv) {
     if (argc <= 1) {
         print_usage(argv[0]);
-        return 0;
+        return 1;
     }
 
     const char * model_path = NULL;
     const char * input_path = NULL;
+    const char * device     = NULL;
     WavFormat    wav_fmt    = WAV_S16;
 
     for (int i = 1; i < argc; i++) {
@@ -84,23 +87,25 @@ int main_impl(int argc, char ** argv) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             input_path = argv[++i];
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            device = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
             if (!audio_parse_format(argv[++i], wav_fmt)) {
                 fprintf(stderr, "[CLI] ERROR: unknown format: %s\n", argv[i]);
                 print_usage(argv[0]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "[CLI] ERROR: unknown arg: %s\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
     }
 
     if (!model_path || !input_path) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (device && !backend_check_device(device)) {
         print_usage(argv[0]);
         return 1;
     }
@@ -113,7 +118,7 @@ int main_impl(int argc, char ** argv) {
 
     const std::string out_str = (mode == 1) ? swap_ext(input_path, ".rvq") : swap_ext(input_path, ".wav");
 
-    BackendPair bp = backend_init("Codec");
+    BackendPair bp = backend_init("Codec", device);
     if (!bp.backend) {
         return 1;
     }
