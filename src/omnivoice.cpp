@@ -13,6 +13,7 @@
 #include "audio-postproc.h"
 #include "backend.h"
 #include "bpe.h"
+#include "lang-map.h"
 #include "ov-error.h"
 #include "pipeline-codec.h"
 #include "pipeline-tts.h"
@@ -20,6 +21,7 @@
 #include "voice-design.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -177,6 +179,7 @@ void ov_init_default_params(struct ov_init_params * p) {
     p->codec_path  = nullptr;
     p->use_fa      = true;
     p->clamp_fp16  = false;
+    p->device      = nullptr;
 }
 
 void ov_tts_default_params(struct ov_tts_params * p) {
@@ -238,7 +241,9 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
     // ov_free, which is idempotent on partial state (NULL-safe sched, NULL
     // GGUF handles, refcount-correct backend release).
     try {
-        ov->bp = backend_init("LM");
+        // The device field exists from ABI 4, an older struct takes the
+        // best available device.
+        ov->bp = backend_init("LM", params->abi_version >= 4 ? params->device : nullptr);
         if (!ov->bp.backend) {
             ov_throw("ov_init: backend_init failed (no GGML backend available)");
         }
@@ -283,6 +288,19 @@ void ov_free(struct ov_context * ov) {
     delete ov;
 }
 
+// A language the synthesis speaks: none, empty or NULL for auto, or what
+// resolve_language finds in the table, an ISO id or a name in any case.
+static bool ov_language_known(const char * lang) {
+    if (!lang || !lang[0]) {
+        return true;
+    }
+    std::string name = lang;
+    for (char & c : name) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return name == "none" || !resolve_language(lang).empty();
+}
+
 enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out) {
     if (!ov || !params) {
         ov_set_error("ov_synthesize: ov / params is NULL");
@@ -313,6 +331,13 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
             ov_audio_free(out);
         }
         ov_log(OV_LOG_ERROR, "[OmniVoice] ov_synthesize requires a codec-loaded handle");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!ov_language_known(params->lang)) {
+        ov_set_error("ov_synthesize: unknown language '%s'", params->lang);
+        if (out) {
+            ov_audio_free(out);
+        }
         return OV_STATUS_INVALID_PARAMS;
     }
     // Defense in depth: the synthesis path normally reports failures via
@@ -347,6 +372,24 @@ int ov_num_codebooks(const struct ov_context * ov) {
         return 0;
     }
     return ov->pt.lm.num_audio_codebook;
+}
+
+int ov_n_languages(void) {
+    return LANG_NAME_TO_ID_TABLE_N;
+}
+
+const char * ov_language_id(int i) {
+    if (i < 0 || i >= LANG_NAME_TO_ID_TABLE_N) {
+        return NULL;
+    }
+    return LANG_NAME_TO_ID_TABLE[i].second;
+}
+
+const char * ov_language_name(int i) {
+    if (i < 0 || i >= LANG_NAME_TO_ID_TABLE_N) {
+        return NULL;
+    }
+    return LANG_NAME_TO_ID_TABLE[i].first;
 }
 
 void ov_voice_ref_free(struct ov_voice_ref * ref) {

@@ -210,7 +210,7 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
                 prec = GGML_PREC_DEFAULT;
             }
         }
-        ggml_flash_attn_ext_set_prec(attn, prec);
+        ggml_prec_set_acc(attn, prec);
     }
 
     // 7) Reshape back: [D, Nh, S(, B)] -> [Nh*D, S(, B)]
